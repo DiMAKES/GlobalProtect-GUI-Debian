@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=GlobalProtect в трее
+Exec=/usr/bin/gp-vpn-tray
+Icon=network-vpn
+Terminal=false
+NoDisplay=true

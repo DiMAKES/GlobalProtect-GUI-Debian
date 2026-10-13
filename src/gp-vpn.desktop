@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=VPN GlobalProtect
+Exec=/usr/bin/gp-vpn-tray --show
+Icon=network-vpn
+Terminal=false
+Categories=Network;
