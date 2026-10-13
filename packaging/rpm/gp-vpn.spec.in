@@ -1,34 +1,41 @@
-# Двоичный rpm из готового дерева (собирает build.sh): rpmbuild -bb --target <arch>
-%global debug_package %{nil}
-%global __os_install_post %{nil}
-%global _build_id_links none
-
+# rpm из готового дерева (собирает build.sh): rpmbuild -bb
 Name:           gp-vpn
 Version:        @VERSION@
 Release:        1
-Summary:        GlobalProtect VPN client with a Windows-like tray panel
+Summary:        Windows-like tray panel for the official GlobalProtect client
 License:        GPL-3.0-or-later
 URL:            @URL@
-Requires:       python3, python3-gobject, sudo, systemd, openssl, ca-certificates
+BuildArch:      noarch
+# Официальный клиент Palo Alto ставится отдельно (его выдаёт организация)
+Requires:       /opt/paloaltonetworks/globalprotect/PanGPA
+Requires:       python3, python3-gobject, sudo, systemd, util-linux
 # Fedora/RHEL — первое имя, openSUSE — второе
-Requires:       (iproute or iproute2)
 Requires:       (python3-cairo or python3-gobject-cairo)
 Requires:       (gtk3 or typelib-1_0-Gtk-3_0)
 Requires:       (libnotify or typelib-1_0-Notify-0_7)
+Requires:       (shadow-utils or shadow)
+Requires:       (procps-ng or procps)
 Recommends:     gnome-shell-extension-appindicator
 Conflicts:      globalprotect-openconnect
 
 %description
-Tray icon and panel for GlobalProtect VPN (status, connect/disconnect, gateway
-switching on the fly, SSO/SAML, password and client certificate login, login
-screen support), the gp-vpn service with HIP report and gpclient/gpauth
-@GPCLIENT@ from globalprotect-openconnect (without the paid GUI).
+Tray icon and Windows-like panel for the official Palo Alto Networks
+GlobalProtect client (CLI version): status, connect/disconnect, OTP and other
+prompts, gateway switching on the fly, connecting from the login screen.
+The agent runs under the gpvpn service account, so the VPN works before
+login and survives logins and logouts.
 
 %install
 cp -a @ROOT@/. %{buildroot}/
 
+%post
+/usr/libexec/gp-vpn/setup || :
+
 %preun
-if [ "$1" -eq 0 ]; then systemctl stop gp-vpn 2>/dev/null || :; fi
+if [ "$1" -eq 0 ]; then systemctl disable --now gp-vpn-agent.service 2>/dev/null || :; fi
+
+%postun
+if [ "$1" -eq 0 ]; then systemctl daemon-reload 2>/dev/null || :; fi
 
 %files
 @FILES@

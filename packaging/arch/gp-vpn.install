@@ -1,3 +1,0 @@
-pre_remove() {
-  systemctl stop gp-vpn 2>/dev/null || true
-}

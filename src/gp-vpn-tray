@@ -1,14 +1,13 @@
 #!/usr/bin/python3
-# GlobalProtect: значок в трее и панель как в Windows-клиенте — статус, вход, гейты, журнал.
-# Перед входом панель спрашивает портал (prelogin), как входить: логин и пароль, SSO/SAML (gpauth)
-# или сертификат клиента. Первый раз подключается через «Автовыбор»; список гейтов портала
-# запоминает служба (/var/lib/gp-vpn/gateways) — дальше гейт меняется на лету.
-# Подключает root-часть: sudo gp-vpn connect|disconnect. Пароли хранятся только в памяти процесса.
+# Надстройка над официальным GlobalProtect (Palo Alto) для Linux: значок в трее и панель как в Windows —
+# статус, вход, смена гейта, журнал. VPN делает сам официальный клиент: служба PanGPS и агент PanGPA,
+# который работает у служебной учётки gpvpn (служба gp-vpn-agent), поэтому VPN доступен и на экране входа.
+# Панель управляет им через CLI: sudo -n -u gpvpn /usr/libexec/gp-vpn/gp <команда>. Запросы CLI
+# (логин, пароль, код, выбор гейта или сертификата, «да/нет») она отвечает из формы или спрашивает в панели.
 #   gp-vpn-tray            значок в трее (автозапуск в сеансе)
 #   gp-vpn-tray --show     открыть панель (ярлык в меню; если значок уже запущен — у него)
 #   gp-vpn-tray --greeter  панель на экране входа (GDM): VPN до входа доменного пользователя
-import fcntl, math, os, signal, ssl, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
-import xml.etree.ElementTree as ET
+import fcntl, math, os, pty, re, signal, subprocess, sys, termios, threading, time
 
 GREETER = "--greeter" in sys.argv
 if not GREETER:
@@ -23,20 +22,33 @@ gi.require_foreign("cairo")
 from gi.repository import Gdk, Gio, GLib, Gtk, Notify, Pango
 
 T = "GlobalProtect"
-VPN = "/usr/sbin/gp-vpn"
-GPAUTH = "/usr/bin/gpauth"
-STATE = "/var/lib/gp-vpn"
-LOG = "/run/gp-vpn.log"
-TUN = "gpvpn0"  # имя туннеля задаёт gp-vpn
-CURRENT = "/run/gp-vpn.gateway"
+GP = os.environ.get("GP_VPN_GP", "sudo -n -u gpvpn /usr/libexec/gp-vpn/gp").split()  # GP_VPN_GP — для проверок
+PORTAL_FILE = "/var/lib/gpvpn/portal"  # последний портал, его пишет обёртка gp
+CONF = os.path.join(GLib.get_user_config_dir(), "gp-vpn")
 APPINDICATOR = "appindicatorsupport@rgcjonas.gmail.com"
 AUTO = "Автовыбор"
 BUSY = ("connecting", "disconnecting")
-TITLES = {"on": "Подключено", "connecting": "Подключение…", "disconnecting": "Отключение…", "off": "Не подключено"}
-ICONS = {"on": "network-vpn", "connecting": "network-vpn-acquiring", "disconnecting": "network-vpn-acquiring",
-         "off": "network-vpn-disconnected-symbolic"}
-GREEN, AMBER, GREY, CARD = (0.24, 0.81, 0.56), (0.96, 0.69, 0.25), (0.54, 0.57, 0.71), (0.118, 0.129, 0.188)
-COLORS = {"on": GREEN, "connecting": AMBER, "disconnecting": AMBER, "off": GREY}
+TITLES = {"on": "Подключено", "internal": "Внутренняя сеть", "connecting": "Подключение…",
+          "disconnecting": "Отключение…", "off": "Не подключено"}
+ICONS = {"on": "network-vpn", "internal": "network-vpn", "connecting": "network-vpn-acquiring",
+         "disconnecting": "network-vpn-acquiring", "off": "network-vpn-disconnected-symbolic"}
+GREEN, BLUE, AMBER, GREY, CARD = (0.24, 0.81, 0.56), (0.48, 0.64, 0.97), (0.96, 0.69, 0.25), (0.54, 0.57, 0.71), (0.118, 0.129, 0.188)
+COLORS = {"on": GREEN, "internal": BLUE, "connecting": AMBER, "disconnecting": AMBER, "off": GREY}
+PROMPTS = {  # частые запросы CLI — по-русски (оригинал остаётся в скобках)
+    "passcode": "Введите одноразовый код",
+    "otp": "Введите одноразовый код",
+    "token": "Введите код с токена",
+    "reason": "Укажите причину отключения",
+    "ticket": "Укажите номер заявки",
+}
+KNOWN_ERRORS = {  # частые ответы портала/шлюза — по-человечески
+    "user authentication failed": "Портал отклонил логин или пароль. Проверьте раскладку клавиатуры и Caps Lock.",
+    "auth-failed": "Портал отклонил логин или пароль. Проверьте раскладку клавиатуры и Caps Lock.",
+    "cannot connect to globalprotect portal": "Портал не отвечает — проверьте адрес и интернет.",
+    "invalid portal": "Неверный адрес портала.",
+    "cannot connect to local gpd service": "Не запущена служба GlobalProtect (gpd / gp-vpn-agent).",
+    "занят другой командой": "GlobalProtect занят другой командой — попробуйте ещё раз.",
+}
 
 CSS = b"""
 #gpvpn { background: transparent; }
@@ -45,14 +57,15 @@ CSS = b"""
 #card .title { font-weight: bold; }
 #card .status { font-size: 17pt; font-weight: bold; color: #c3c8e0; }
 #card .status.on { color: #3ecf8e; }
+#card .status.internal { color: #7aa2f7; }
 #card .status.connecting, #card .status.disconnecting { color: #f5b041; }
 #card .muted { color: #8a91b4; font-size: 9.5pt; }
 #card .caption { color: #8a91b4; font-size: 9pt; font-weight: bold; margin-top: 6px; }
 #card .error { color: #ff7a8f; font-size: 9.5pt; }
-#card entry, #card combobox button, #card filechooserbutton button { background: #262a3d; background-image: none;
-  color: #e6e9f5; border: 1px solid #353b58; border-radius: 9px; padding: 6px 10px; box-shadow: none; }
-#card entry:focus, #card combobox button:hover, #card filechooserbutton button:hover { border-color: #4f8cff; }
-#card expander title label { color: #8a91b4; font-size: 9.5pt; }
+#card .question { color: #e6e9f5; font-size: 10pt; }
+#card entry, #card combobox button { background: #262a3d; background-image: none; color: #e6e9f5;
+  border: 1px solid #353b58; border-radius: 9px; padding: 6px 10px; box-shadow: none; }
+#card entry:focus, #card combobox button:hover { border-color: #4f8cff; }
 #card button.flat { background: none; border: none; box-shadow: none; padding: 4px; color: #8a91b4; border-radius: 8px; }
 #card button.flat:hover { background: #2b2f45; }
 #card button.main { background: #4f8cff; background-image: none; border: none; border-radius: 10px;
@@ -68,121 +81,78 @@ CSS = b"""
 """
 
 
-def os_name():
+def clean(text):
+    # CLI рисует индикатор «\r<пробелы>\r» и пишет \r\n — оставляем обычные строки
+    return "\n".join(raw.split("\r")[-1].rstrip() for raw in text.replace("\r\n", "\n").split("\n"))
+
+
+def gp(*args, timeout=30):
+    # Одна команда CLI без диалога
     try:
-        with open("/etc/os-release") as f:
-            for l in f:
-                if l.startswith("PRETTY_NAME="):
-                    return l.split("=", 1)[1].strip().strip('"')
-    except OSError:
-        pass
-    return "Linux"
+        p = subprocess.run(GP + list(args), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, clean(p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
 
 
-UA = f"PAN GlobalProtect/6.3.3-619 (Linux {os_name()})"  # как у gpclient: иначе портал отвечает иначе
-_settings = [None, {}]
+def parse_status(out):
+    m = re.search(r"GlobalProtect status:\s*(.+)", out)
+    if not m:
+        return None
+    s = m.group(1).strip().lower()
+    if "internal" in s:
+        return "internal"
+    if s.startswith("connected"):
+        return "on"
+    if s.startswith("disconnecting"):
+        return "disconnecting"
+    if s.startswith(("connecting", "discover", "retriev", "authent")):
+        return "connecting"
+    return "off"
 
 
-def settings():
-    # Файл пишет gp-vpn через printf %q — читаем тем же bash, и только когда он изменился
-    try:
-        mtime = os.stat(f"{STATE}/settings").st_mtime_ns
-    except OSError:
-        mtime = 0
-    if _settings[0] != mtime:
-        keys = ("PORTAL", "LOGIN", "LOCATION", "AUTH", "CERT")
-        out = subprocess.run(["bash", "-c", '[ -f "$1" ] && . "$1"; printf "%s\\0" ' + " ".join(f'"${k}"' for k in keys),
-                              "_", f"{STATE}/settings"], capture_output=True, text=True).stdout.split("\0")
-        _settings[:] = [mtime, dict(zip(keys, out))]
-    return _settings[1]
+def parse_fields(out):
+    return {k.strip(): v.strip() for k, v in (l.split(":", 1) for l in out.splitlines() if ":" in l)}
 
 
-def gateways(portal):
-    # [(название, адрес)] — список гейтов портала, который запомнила служба
-    try:
-        with open(f"{STATE}/gateways") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return []
-    if not lines or lines[0] != f"# {portal}":
-        return []
-    return [tuple(l.split("\t", 1)) for l in lines[1:] if "\t" in l]
+def parse_gateways(out):
+    # Таблица «Name  Address  Preferred» из show --manual-gateway -> [(имя, адрес, предпочтён)]
+    rows, table = [], False
+    for l in out.splitlines():
+        if l.startswith("---"):
+            table = True
+        elif table and l.strip():
+            # колонки бывают слиты одним пробелом: справа «yes/no», перед ним адрес (без пробелов), слева имя
+            words = l.split()
+            pref = words[-1].lower() in ("yes", "true") if words[-1].lower() in ("yes", "no", "true", "false") else None
+            if pref is not None:
+                words = words[:-1]
+            addr = words.pop() if len(words) > 1 else ""
+            rows.append((" ".join(words), addr, bool(pref)))
+    return rows
 
 
-def prelogin(portal):
-    # Что портал говорит о входе — тот же запрос, что делает gpclient перед входом (без логина и пароля)
-    data = urllib.parse.urlencode({"tmp": "tmp", "clientVer": "4100", "clientos": "Linux", "os-version": f"Linux {os_name()}",
-                                   "ipv6-support": "yes", "default-browser": "0", "cas-support": "yes"}).encode()
-    req = urllib.request.Request(f"https://{portal}/global-protect/prelogin.esp", data, {"User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            root = ET.parse(r).getroot()
-    except (ssl.SSLError, urllib.error.URLError, OSError, ET.ParseError) as e:
-        err = getattr(e, "reason", e)
-        text = str(err)
-        if "CERTIFICATE_REQUIRED" in text or "HANDSHAKE_FAILURE" in text:
-            return {"method": "cert"}
-        if isinstance(err, ssl.SSLCertVerificationError):
-            return {"error": "сертификат портала не доверенный (нет корневого сертификата организации?)"}
-        if isinstance(e, ET.ParseError):
-            return {"error": "по этому адресу не портал GlobalProtect"}
-        return {"error": text}
-    if (root.findtext("status") or "").lower() != "success":
-        return {"error": (root.findtext("msg") or "портал отклонил запрос").strip()}
-    label = lambda tag, default: (root.findtext(tag) or "").strip() or default
-    return {"method": "saml" if (root.findtext("saml-auth-method") or "").strip() else "password",
-            "message": label("authentication-message", ""),
-            "user": label("username-label", "Username"), "password": label("password-label", "Password")}
-
-
-def vpn_state():
-    if subprocess.run(["systemctl", "is-active", "--quiet", "gp-vpn"]).returncode:
-        return "off"
-    return "on" if os.path.exists(f"/sys/class/net/{TUN}") else "connecting"
-
-
-def tun_ip():
-    f = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", TUN], capture_output=True, text=True).stdout.split()
-    return f[3].split("/")[0] if len(f) > 3 else ""
-
-
-def connected_since():
-    # Момент запуска службы gp-vpn по монотонным часам — те же, что у time.monotonic()
-    us = subprocess.run(["systemctl", "show", "gp-vpn", "-p", "ActiveEnterTimestampMonotonic", "--value"],
-                        capture_output=True, text=True).stdout.strip()
-    return int(us) / 1e6 if us.isdigit() and int(us) else time.monotonic()
+def friendly(out):
+    low = out.lower()
+    for key, msg in KNOWN_ERRORS.items():
+        if key in low:
+            return msg
+    lines = [l.strip() for l in out.splitlines() if re.search(r"error|fail|unable|cannot|invalid|denied", l, re.I)]
+    return lines[-1][:300] if lines else ""
 
 
 def read(path):
     try:
         with open(path) as f:
-            return f.read()
+            return f.read().strip()
     except OSError:
         return ""
 
 
-KNOWN_ERRORS = {  # частые ответы портала/шлюза — по-человечески
-    "auth-failed": "Портал отклонил логин или пароль. Проверьте раскладку клавиатуры и Caps Lock.",
-    "Matching client config not found": "Для этого пользователя на портале нет настроек подключения.",
-    "certificate verify failed": "Сертификат портала не доверенный (нет корневого сертификата организации?).",
-    "dns error": "Адрес портала или гейта не находится в DNS — проверьте адрес и сеть.",
-    "failed before tunnel setup": "Ни один гейт не ответил. Если вы в офисной сети, VPN не нужен; иначе проверьте интернет.",
-}
-
-
-def last_error():
-    # Последняя строка журнала с ошибкой, без метки времени gpclient
-    text = read(LOG)
-    for key, msg in KNOWN_ERRORS.items():
-        if key in text:
-            return msg
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    hits = [l for l in lines if "ERROR" in l or l.startswith("Error:")] or lines[-1:]
-    return hits[-1].split("] ", 1)[-1][:300] if hits else ""
-
-
-def clean_portal(text):
-    return text.strip().split("://")[-1].split("/")[0]
+def save_login(login):
+    os.makedirs(CONF, exist_ok=True)
+    with open(os.path.join(CONF, "login"), "w") as f:
+        f.write(login + "\n")
 
 
 def notify(text):
@@ -211,12 +181,12 @@ def draw_globe(cr, w, h, state, angle):
         cr.set_source_rgb(*c)
         cr.arc(cx, cy, r, angle, angle + 1.7)
     else:
-        cr.set_source_rgba(*c, 1 if state == "on" else 0.45)
+        cr.set_source_rgba(*c, 0.45 if state == "off" else 1)
         cr.arc(cx, cy, r, 0, tau)
     cr.stroke()
     # Глобус: контур, меридианы, параллели
     g = r * 0.52
-    cr.set_source_rgba(*c, 0.95 if state == "on" else 0.7)
+    cr.set_source_rgba(*c, 0.7 if state == "off" else 0.95)
     cr.set_line_width(2.2)
     cr.arc(cx, cy, g, 0, tau)
     cr.stroke()
@@ -234,7 +204,7 @@ def draw_globe(cr, w, h, state, angle):
         cr.line_to(cx + half, cy + k * g)
     cr.stroke()
     # Галочка «защищено» на кольце
-    if state == "on":
+    if state in ("on", "internal"):
         bx, by, br = cx + r * 0.707, cy + r * 0.707, r * 0.22
         cr.set_source_rgb(*CARD)
         cr.arc(bx, by, br + 4, 0, tau)
@@ -256,20 +226,95 @@ def styled(widget, *classes):
     return widget
 
 
+class Session:
+    """Интерактивная команда CLI в псевдотерминале: каждый запрос (строка без перевода строки,
+    после которой CLI замолчал) уходит в on_prompt, ответ — send(); по завершении — on_done(rc, вывод)."""
+
+    def __init__(self, args, on_prompt, on_done):
+        self.args, self.on_prompt, self.on_done = args, on_prompt, on_done
+        self.out, self.asked, self.timer, self.cancelling = "", -1, None, False
+        self.mark = 0  # с какого места вывода начинается то, что CLI написал после нашего ответа
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            try:
+                a = termios.tcgetattr(0)
+                a[3] &= ~termios.ECHO  # ответы (и пароль) не попадают в вывод
+                termios.tcsetattr(0, termios.TCSANOW, a)
+                os.execvp(GP[0], GP + args)
+            finally:
+                os._exit(127)
+        GLib.io_add_watch(self.fd, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.read)
+
+    def read(self, fd, cond):
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            self.finish()
+            return False
+        self.out += data.decode(errors="replace")
+        if self.timer:
+            GLib.source_remove(self.timer)
+        self.timer = GLib.timeout_add(350, self.check)
+        return True
+
+    def check(self):
+        self.timer = None
+        text = clean(self.out)
+        lines = text[self.mark:].split("\n")
+        if lines[-1].strip() and len(text) != self.asked:
+            self.asked = len(text)
+            self.on_prompt(self, lines[-1].strip(), [l for l in lines[:-1] if l.strip()])
+        return False
+
+    def send(self, answer):
+        try:
+            os.write(self.fd, (answer + "\n").encode())
+        except OSError:
+            pass
+        self.out += "\n"
+        self.mark = len(clean(self.out))
+
+    def cancel(self):
+        self.cancelling = True
+        try:
+            os.write(self.fd, b"\x03")  # Ctrl-C; на «Want to cancel current command?» ответим «y»
+        except OSError:
+            pass
+        GLib.timeout_add_seconds(6, self.kill)
+
+    def kill(self):
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        return False
+
+    def finish(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+        try:
+            _, status = os.waitpid(self.pid, 0)
+            rc = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            rc = 1
+        os.close(self.fd)
+        self.on_done(self, rc, clean(self.out))
+
+
 class Tray:
     def __init__(self):
-        self.pw = self.keypw = None   # пароль и пароль от сертификата, введённые в панели
-        self.busy = None              # "connecting"/"disconnecting"/"sso", пока идёт действие
-        self.waiting = False          # ждём туннель после нашего подключения
-        self.state = None
-        self.since = self.ip = None
+        self.state, self.details, self.gws = None, {}, []
+        self.since = None
+        self.session = None           # идёт диалог с CLI (подключение, отключение, смена гейта…)
+        self.busy = None              # "connecting"/"disconnecting" на время диалога
+        self.question = None          # (вид, варианты) — CLI ждёт ответа пользователя
+        self.creds = {}               # логин/пароль для текущего диалога; пароль хранится только в памяти
+        self.pw = None
+        self.log = []                 # стенограммы диалогов с CLI (без ответов пользователя)
         self.angle, self.spinning = 0.0, None
         self.hidden_at, self.pos, self.anchor, self.filling = 0.0, None, None, False
-        self.method = None            # ответ prelogin для адреса в форме
-        self.checked = None           # для какого адреса он получен
-        self.check_timer = None
-        self.gw_mtime = None
-        self.gpauth = None
         self.icon = None
         if not GREETER:
             self.icon = Gtk.StatusIcon(title=T)
@@ -277,8 +322,9 @@ class Tray:
             self.icon.connect("popup-menu", lambda i, b, t: self.toggle(at_pointer=True))
             GLib.timeout_add_seconds(20, self.ensure_tray)  # расширения оболочки грузятся не сразу
         self.build()
-        self.tick()
-        GLib.timeout_add_seconds(1, self.tick)
+        self.refresh()
+        self.poke = threading.Event()
+        threading.Thread(target=self.poll, daemon=True).start()
 
     def ensure_tray(self):
         # В чистом GNOME трея нет — включаем расширение AppIndicator: оно показывает и такие значки
@@ -290,6 +336,42 @@ class Tray:
         exts = s.get_strv("enabled-extensions")
         if not any("tray" in e.lower() or "indicator" in e.lower() for e in exts):  # уже есть свой трей
             s.set_strv("enabled-extensions", exts + [APPINDICATOR])
+        return False
+
+    # ---------- фон: состояние клиента ----------
+    def poll(self):
+        last_info = 0
+        while True:
+            if not self.session:
+                rc, out = gp("show", "--status")
+                st = parse_status(out) if rc == 0 else None
+                info = None
+                if st and (time.monotonic() - last_info > 10 or self.poke.is_set()):
+                    det = parse_fields(gp("show", "--details")[1]) if st in ("on", "internal") else {}
+                    info = (det, parse_gateways(gp("show", "--manual-gateway")[1]))
+                    last_info = time.monotonic()
+                self.poke.clear()
+                GLib.idle_add(self.polled, st, info)
+            self.poke.wait(2)
+
+    def polled(self, st, info):
+        if st is None or self.session:  # CLI занят или отвечает с ошибкой — оставляем, что было
+            return False
+        old, self.state = self.state, st
+        if info is not None:
+            self.details, gws = info
+            if gws != self.gws:
+                self.gws = gws
+                self.fill_gateways()
+            up = self.details.get("Uptime(sec)", "")
+            self.since = time.monotonic() - int(up) if up.isdigit() else None
+        if old in ("off", "connecting", None) and st in ("on", "internal") and old is not None:
+            notify(f"VPN подключен: {self.where_text()}")
+        elif old in ("on", "internal") and st == "off":
+            notify("VPN отключен")
+        if st in ("on", "internal") and old not in ("on", "internal"):
+            self.poke.set()  # сразу подтянуть гейт, IP, время
+        self.refresh()
         return False
 
     # ---------- панель ----------
@@ -318,7 +400,9 @@ class Tray:
         head = Gtk.Box(spacing=6)
         head.pack_start(styled(Gtk.Label(label=T, xalign=0), "title"), True, True, 0)
         self.menu = Gtk.Menu()
-        items = [("Сменить портал или учётную запись", self.show_form), ("Журнал подключения", self.show_log)]
+        items = [("Забыть сохранённую учётную запись", self.forget_user),
+                 ("Отправить HIP-отчёт заново", self.resubmit_hip),
+                 ("Журнал подключения", self.show_log)]
         if not GREETER:
             items += [(None, None), ("Убрать значок из трея", Gtk.main_quit)]
         for label, cb in items:
@@ -338,38 +422,35 @@ class Tray:
         card.add(self.art)
         self.status = styled(Gtk.Label(), "status")
         self.where = styled(Gtk.Label(ellipsize=Pango.EllipsizeMode.END), "muted")
-        self.details = styled(Gtk.Label(), "muted")
-        for x in (self.status, self.where, self.details):
+        self.info = styled(Gtk.Label(), "muted")
+        for x in (self.status, self.where, self.info):
             card.add(x)
 
-        # Вход: адрес портала, затем поля под способ входа, который сообщил портал
-        self.form = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
-        fb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        _, self.e_portal = self.field(fb, "Адрес портала", activate=self.check_portal)
-        self.e_portal.connect("changed", lambda *a: self.check_portal(later=True))
-        self.e_portal.connect("focus-out-event", lambda *a: self.check_portal() and False)
-        self.hint = styled(Gtk.Label(xalign=0, wrap=True, max_width_chars=38), "muted")
-        fb.add(self.hint)
-        self.creds = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.l_login, self.e_login = self.field(self.creds, "Логин")
-        self.l_pw, self.e_pw = self.field(self.creds, "Пароль", visible=False)
-        fb.add(self.creds)
-        self.cert_box = Gtk.Expander(label="Сертификат клиента", margin_top=4)
-        cb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=4)
-        self.e_cert = Gtk.FileChooserButton(title="Сертификат клиента (.p12, .pfx, .pem)")
-        flt = Gtk.FileFilter()
-        flt.set_name("Сертификаты")
-        for pat in ("*.p12", "*.pfx", "*.pem", "*.P12", "*.PFX", "*.PEM"):
-            flt.add_pattern(pat)
-        self.e_cert.add_filter(flt)
-        cb.add(self.e_cert)
-        self.e_keypw = Gtk.Entry(visibility=False, placeholder_text="Пароль от сертификата, если есть")
-        self.e_keypw.connect("activate", lambda *a: self.on_button())
-        cb.add(self.e_keypw)
-        self.cert_box.add(cb)
-        fb.add(self.cert_box)
-        self.form.add(fb)
+        # Вход: портал, логин, пароль (пароль можно не вводить, если клиент его сохранил)
+        self.form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.e_portal = self.field(self.form, "Адрес портала")
+        self.e_login = self.field(self.form, "Логин")
+        self.e_pw = self.field(self.form, "Пароль", visible=False)
+        self.e_portal.set_text(read(PORTAL_FILE))
+        self.e_login.set_text(read(os.path.join(CONF, "login")))
         card.add(self.form)
+
+        # Вопрос клиента: код, выбор из списка, «да/нет»
+        self.qbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6)
+        self.q_text = styled(Gtk.Label(xalign=0, wrap=True, max_width_chars=38, selectable=True), "question")
+        self.q_entry = Gtk.Entry(activates_default=False)
+        self.q_entry.connect("activate", lambda *a: self.answer())
+        self.q_combo = Gtk.ComboBoxText()
+        self.q_yesno = Gtk.Box(spacing=8, homogeneous=True)
+        for label, value in (("Да", "y"), ("Нет", "n")):
+            b = styled(Gtk.Button(label=label), "main")
+            b.connect("clicked", lambda _b, v=value: self.answer(v))
+            self.q_yesno.add(b)
+        q_cancel = styled(Gtk.Button(label="Отменить", halign=Gtk.Align.START), "link")
+        q_cancel.connect("clicked", lambda *a: self.session and self.on_button_cancel())
+        for x in (self.q_text, self.q_entry, self.q_combo, self.q_yesno, q_cancel):
+            self.qbox.add(x)
+        card.add(self.qbox)
 
         self.gw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.gw_box.add(styled(Gtk.Label(label="Гейт", xalign=0), "caption"))
@@ -391,60 +472,72 @@ class Tray:
         card.add(self.button)
         card.show_all()
         self.errbox.hide()
-        self.update_form()
+        self.qbox.hide()
+        self.fill_gateways()
 
-    def field(self, box, caption, visible=True, activate=None):
-        label = styled(Gtk.Label(label=caption, xalign=0), "caption")
+    def field(self, box, caption, visible=True):
+        box.add(styled(Gtk.Label(label=caption, xalign=0), "caption"))
         e = Gtk.Entry(visibility=visible)
-        e.connect("activate", lambda *a: (activate or self.on_button)())
-        box.add(label)
+        e.connect("activate", lambda *a: self.on_button())
         box.add(e)
-        return label, e
+        return e
 
     def shown_state(self):
-        return {"sso": "connecting"}.get(self.busy, self.busy) or self.state
+        return self.busy or self.state or "off"
 
-    def current_label(self, s):
-        c = read(CURRENT).strip()
-        for label, host in gateways(s["PORTAL"]):
-            if c in (label, host):
-                return label
-        return c
-
-    def where_text(self, s):
-        if not s["PORTAL"]:
-            return "Портал не задан"
-        loc = s["LOCATION"]
-        if loc in ("", "auto"):
-            cur = self.current_label(s) if self.state == "on" else ""
-            loc = f"{AUTO} → {cur}" if cur else AUTO
-        return f"{loc} · {s['PORTAL']}"
+    def where_text(self):
+        d = self.details
+        gw = d.get("Gateway Description") or d.get("Gateway Name") or ""
+        portal = read(PORTAL_FILE) or self.e_portal.get_text().strip()
+        pref = next((n for n, _, p in self.gws if p), None)
+        if self.state in ("on", "internal") and gw:
+            gw = gw if pref else f"{AUTO} → {gw}"
+        elif not gw:
+            gw = pref or AUTO
+        return " · ".join(x for x in (gw, portal) if x) or "Портал не задан"
 
     def refresh(self):
-        s, st = settings(), self.shown_state()
+        st = self.shown_state()
         sc = self.status.get_style_context()
         for k in TITLES:
             sc.remove_class(k)
         sc.add_class(st)
-        self.status.set_text("Вход через SSO…" if self.busy == "sso" else TITLES[st])
-        self.where.set_text(self.where_text(s))
-        if st == "on":
-            t = int(time.monotonic() - (self.since or time.monotonic()))
-            self.details.set_text(f"IP {self.ip or '—'}   ·   {t // 3600:02}:{t // 60 % 60:02}:{t % 60:02}")
-        self.details.set_visible(st == "on")
+        self.status.set_text(TITLES[st])
+        self.where.set_text(self.where_text())
+        if st in ("on", "internal"):
+            ip = self.details.get("Assigned IP Address") or "—"
+            text = f"IP {ip}"
+            if self.since is not None:
+                t = int(time.monotonic() - self.since)
+                text += f"   ·   {t // 3600:02}:{t // 60 % 60:02}:{t % 60:02}"
+            self.info.set_text(text)
+        self.info.set_visible(st in ("on", "internal"))
 
-        login = self.form.get_reveal_child()
-        if login or st == "off":
-            label = "Войти через SSO" if login and self.method_is("saml") else "Подключить"
+        asking = self.question is not None
+        kind = self.question[0] if asking else None
+        self.qbox.set_visible(asking)
+        self.q_entry.set_visible(kind in ("text", "secret"))
+        self.q_combo.set_visible(kind == "choice")
+        self.q_yesno.set_visible(kind == "confirm")
+        self.form.set_visible(st == "off" and not self.session)
+        self.gw_box.set_visible(not asking and bool(self.gws))
+
+        if asking and kind != "confirm":
+            label, stop = "Ответить", False
+        elif self.session:
+            label, stop = "Отмена", True
+        elif st == "off":
+            label, stop = "Подключить", False
         else:
-            label = {"on": "Отключить", "connecting": "Отмена"}.get(st, TITLES[st])
+            label, stop = "Отключить", True
         self.button.set_label(label)
         bc = self.button.get_style_context()
-        (bc.remove_class if login or st == "off" else bc.add_class)("stop")
-        self.button.set_sensitive(self.busy in (None, "sso"))
-        self.combo.set_sensitive(self.busy is None)
-        self.gw_box.set_visible(not login or bool(gateways(clean_portal(self.e_portal.get_text()))))
+        (bc.add_class if stop else bc.remove_class)("stop")
+        self.combo.set_sensitive(not self.session)
 
+        if self.icon:
+            self.icon.set_from_icon_name(ICONS[st])
+            self.icon.set_tooltip_text(f"{T}: {TITLES[st]}" + (f" — {self.where_text()}" if st in ("on", "internal") else ""))
         self.art.queue_draw()
         if st in BUSY and not self.spinning and self.win.get_visible():
             self.spinning = GLib.timeout_add(30, self.spin)
@@ -458,19 +551,13 @@ class Tray:
         return False
 
     def fill_gateways(self):
-        s = settings()
-        cur = s["LOCATION"] or "auto"
-        labels = [l for l, _ in gateways(s["PORTAL"])]
-        if cur != "auto" and cur not in labels:
-            labels.append(cur)
         self.filling = True
         self.combo.remove_all()
-        self.combo.append("auto", AUTO)
-        for l in labels:
-            self.combo.append(l, l)
-        self.combo.set_active_id(cur)
+        self.combo.append("", AUTO)
+        for name, addr, _ in self.gws:
+            self.combo.append(name, name)
+        self.combo.set_active_id(next((n for n, _, p in self.gws if p), ""))
         self.filling = False
-        return False
 
     def toggle(self, at_pointer=False):
         if self.win.get_visible():
@@ -479,13 +566,11 @@ class Tray:
             return
         # Расширение трея рисует значок в оболочке, его координат GTK не знает — ставим по месту щелчка
         self.anchor = Gdk.Display.get_default().get_default_seat().get_pointer().get_position()[1:] if at_pointer else None
-        self.fill_gateways()
-        if self.state == "off" and not settings()["PORTAL"]:
-            self.show_form(present=False)  # первый запуск: сразу к вводу портала
         self.refresh()
         self.place()
         self.win.show()
         self.win.present_with_time(Gtk.get_current_event_time())
+        (self.e_pw if self.e_portal.get_text() and self.e_login.get_text() else self.e_portal).grab_focus()
         self.refresh()
 
     def show_panel(self):
@@ -496,17 +581,15 @@ class Tray:
             self.toggle()
 
     def hide(self):
-        if GREETER:
+        if GREETER or self.question:  # пока клиент ждёт ответа — не прячем
             return
         self.win.hide()
         self.hidden_at, self.pos = time.monotonic(), None
-        self.form.set_reveal_child(False)
-        self.e_pw.set_text("")
         self.errbox.hide()
 
     def autohide(self):
         if (not GREETER and self.win.get_visible() and not self.win.is_active() and not self.menu.get_visible()
-                and not self.combo.get_property("popup-shown")):
+                and not self.combo.get_property("popup-shown") and not self.q_combo.get_property("popup-shown")):
             self.hide()
         return False
 
@@ -529,197 +612,151 @@ class Tray:
             self.win.move(x, y)
         return False
 
-    # ---------- вход ----------
-    def method_is(self, m):
-        return bool(self.method) and self.method.get("method") == m
-
-    def show_form(self, present=True):
-        s = settings()
-        self.e_portal.set_text(s["PORTAL"])
-        self.e_login.set_text(s["LOGIN"] if s["LOGIN"] != "-" else "")
-        self.e_pw.set_text("")
-        if s["CERT"]:
-            self.e_cert.set_filename(s["CERT"])
-            self.cert_box.set_expanded(True)
-        self.form.set_reveal_child(True)
-        self.checked = None
-        self.check_portal()
-        if present and not self.win.get_visible():
-            self.toggle()
-        (self.e_pw if s["PORTAL"] and s["LOGIN"] not in ("", "-") else self.e_portal).grab_focus()
+    # ---------- диалоги с CLI ----------
+    def run(self, args, busy, **creds):
+        self.errbox.hide()
+        self.busy, self.creds, self.question = busy, dict(creds, used=set()), None
+        self.session = Session(args, self.on_prompt, self.on_done)
         self.refresh()
 
-    def check_portal(self, later=False):
-        # Спрашиваем портал о способе входа: сразу по Enter/уходу из поля, при наборе — с паузой
-        if self.check_timer:
-            GLib.source_remove(self.check_timer)
-            self.check_timer = None
-        if later:
-            self.check_timer = GLib.timeout_add(900, self.check_later)
+    def on_prompt(self, s, line, before):
+        low = line.lower()
+        c = self.creds
+        if s.cancelling and "(y/n)" in low:
+            return s.send("y")
+        if re.fullmatch(r"(?i)username(\(.*\))?:", line):
+            if "user" not in c["used"] and c.get("login") is not None:
+                c["used"].add("user")
+                return s.send(c["login"])
+            return self.ask(s, "text", "\n".join(before[-1:] + [line]))
+        if re.search(r"(?i)password[^:]*:$", line) and "pem" not in low:
+            if "pw" not in c["used"] and c.get("pw"):
+                c["used"].add("pw")
+                return s.send(c["pw"])
+            return self.ask(s, "secret", "Пароль" + (" (прошлый не подошёл)" if "pw" in c["used"] else "") + ":")
+        if "pem pass phrase" in low:
+            return self.ask(s, "secret", "Пароль от сертификата клиента:")
+        m = re.search(r"(?i)choose (.+?) from the list above\(1-(\d+)\):$", line)
+        if m:
+            opts = [mm.groups() for l in before for mm in [re.match(r"^\s*(\d+)[.):]?\s+(.+)$", l)] if mm]
+            target = c.get("gateway")
+            if target and "gateway" in m.group(1).lower():
+                hit = next((n for n, text in opts if target.lower() in text.lower()), None)
+                if hit:
+                    return s.send(hit)
+            what = "гейт" if "gateway" in m.group(1).lower() else "сертификат" if "cert" in m.group(1).lower() else m.group(1)
+            return self.ask(s, "choice", f"Выберите {what}:", opts)
+        if re.search(r"\(y/n\)\??$", low):
+            if c.get("yes"):
+                return s.send("y")
+            return self.ask(s, "confirm", "\n".join(before[-4:] + [line]))
+        # Остальное — код (OTP/passcode), причина отключения и т. п.: спрашиваем как есть
+        secret = bool(re.search(r"pass|pin|token|otp|code|код", low))
+        ru = next((v for k, v in PROMPTS.items() if k in low), None)
+        self.ask(s, "secret" if secret else "text", "\n".join(before[-2:] + [f"{ru} ({line.rstrip(':')}):" if ru else line]))
+
+    def ask(self, s, kind, text, options=()):
+        self.question = (kind, s)
+        self.q_text.set_text(text)
+        self.q_entry.set_text("")
+        self.q_entry.set_visibility(kind != "secret")
+        self.q_combo.remove_all()
+        for n, label in options:
+            self.q_combo.append(n, label)
+        if options:
+            self.q_combo.set_active(0)
+        self.refresh()
+        if not self.win.get_visible():
+            notify("GlobalProtect ждёт ответа")
+            self.show_panel()
+        if kind in ("text", "secret"):
+            self.q_entry.grab_focus()
+
+    def answer(self, value=None):
+        if not self.question:
             return
-        portal = clean_portal(self.e_portal.get_text())
-        if portal == self.checked:
+        kind, s = self.question
+        if value is None:
+            value = self.q_combo.get_active_id() if kind == "choice" else self.q_entry.get_text()
+        self.question = None
+        self.q_entry.set_text("")
+        s.send(value or "")
+        self.refresh()
+
+    def on_done(self, s, rc, out):
+        if s is not self.session:
             return
-        self.checked, self.method = portal, None
-        self.update_form()
-        if portal:
-            threading.Thread(target=lambda: GLib.idle_add(self.got_prelogin, portal, prelogin(portal)), daemon=True).start()
+        self.log.append(f"$ globalprotect {' '.join(s.args)}\n{out}".strip())
+        self.log = self.log[-20:]
+        self.session, self.question, busy = None, None, self.busy
+        self.busy = None
+        problem = friendly(out)
+        if busy == "connecting" and not s.cancelling and (rc or problem):
+            self.fail("Не удалось подключиться.", problem)
+            self.pw = None
+        elif busy == "connecting" and not s.cancelling:
+            self.pw = self.creds.get("pw") or self.pw
+            self.e_pw.set_text("")
+        elif rc and not s.cancelling and problem:
+            self.fail("Команда не выполнена.", problem)
+        self.creds = {}
+        self.poke.set()
+        self.refresh()
 
-    def check_later(self):
-        self.check_timer = None
-        self.check_portal()
-        return False
-
-    def got_prelogin(self, portal, info):
-        if portal == self.checked:  # адрес за это время не поменяли
-            self.method = info
-            self.update_form()
-            self.refresh()
-        return False
-
-    def update_form(self):
-        m = self.method or {}
-        method = m.get("method")
-        if not self.checked:
-            hint, cls = "Введите адрес портала GlobalProtect", "muted"
-        elif not m:
-            hint, cls = "Связь с порталом…", "muted"
-        elif "error" in m:
-            hint, cls = f"Портал не ответил: {m['error']}", "error"
-        elif method == "saml":
-            hint, cls = "Вход через SSO — откроется окно входа организации", "muted"
-        elif method == "cert":
-            hint, cls = "Портал требует сертификат клиента", "muted"
-        else:
-            msg = m.get("message", "")
-            hint, cls = ("Вход по логину и паролю" if msg in ("", "Enter login credentials") else msg), "muted"
-        self.hint.set_text(hint)
-        hc = self.hint.get_style_context()
-        hc.remove_class("muted")
-        hc.remove_class("error")
-        hc.add_class(cls)
-        # Подписи полей — с портала (если он задал свои)
-        user, pw = m.get("user", "Username"), m.get("password", "Password")
-        self.l_login.set_text("Логин" if user == "Username" else user)
-        self.l_pw.set_text("Пароль" if pw == "Password" else pw)
-        self.creds.set_visible(method != "saml" and bool(self.checked))
-        if method == "cert":
-            self.cert_box.set_expanded(True)
+    def on_button_cancel(self):
+        self.session.cancel()
+        self.question = None
+        self.refresh()
 
     def on_button(self):
-        if self.busy == "sso":
-            return self.cancel_sso()
-        if self.form.get_reveal_child() or self.shown_state() == "off":
-            self.connect(self.combo.get_active_id() or "auto")
+        if self.question and self.question[0] != "confirm":
+            return self.answer()
+        if self.session:
+            return self.on_button_cancel()
+        if self.shown_state() == "off":
+            self.connect()
         else:
-            self.disconnect()
+            self.run(["disconnect"], "disconnecting")
+
+    def connect(self, gateway=None):
+        portal = self.e_portal.get_text().strip().split("://")[-1].split("/")[0]
+        if not portal:
+            return self.fail("Введите адрес портала.")
+        login = self.e_login.get_text().strip()
+        if login:
+            save_login(login)
+        pw = self.e_pw.get_text() or self.pw
+        args = ["connect", "--portal", portal] + (["--username", login] if login else [])
+        self.run(args, "connecting", login=login, pw=pw, gateway=gateway)
 
     def on_gateway(self, combo):
-        loc = combo.get_active_id()
-        if not self.filling and loc and self.state == "on" and loc != (settings()["LOCATION"] or "auto"):
-            self.connect(loc)  # смена гейта на лету — переподключение
-
-    def connect(self, loc):
-        s = settings()
-        if self.form.get_reveal_child():
-            portal = clean_portal(self.e_portal.get_text())
-            if not portal:
-                return self.fail("Введите адрес портала.")
-            if portal != s["PORTAL"]:
-                loc = "auto"  # гейты этого портала ещё неизвестны — первый раз через автовыбор
-            cert, keypw = self.e_cert.get_filename() or "", self.e_keypw.get_text()
-            if self.method_is("saml"):
-                return self.sso(portal, loc, cert, keypw)
-            login, pw = self.e_login.get_text().strip(), self.e_pw.get_text()
-            if not login or not (pw or cert):
-                return self.fail("Введите логин и пароль.")
-            return self.start(portal, loc, login, "password", pw, cert, keypw)
-        # Без формы — с тем, что уже известно
-        portal, login, auth, cert = s["PORTAL"], s["LOGIN"], s["AUTH"] or "password", s["CERT"]
-        if not portal or (cert and self.keypw is None):
-            return self.show_form()
-        if auth == "cookie":
-            return self.sso(portal, loc, cert, self.keypw or "")
-        if not self.pw:
-            return self.show_form()
-        self.start(portal, loc, login, "password", self.pw, cert, self.keypw or "")
-
-    def start(self, portal, loc, login, auth, secret, cert="", keypw=""):
-        self.errbox.hide()
-        self.busy = "connecting"
-        self.refresh()
-        args = ["sudo", "-n", VPN, "connect", portal, loc, login or "-", auth] + ([cert] if cert else [])
-        data = (keypw + "\n" if cert else "") + secret + ("\n" if auth == "password" else "")
+        if self.filling or self.session:
+            return
+        name = combo.get_active_id() or None
 
         def work():
-            p = subprocess.run(args, input=data, capture_output=True, text=True)
-            GLib.idle_add(self.started, p, auth, secret, keypw if cert else None)
+            rc, out = gp("set-preferred-gateway", *(["--name", name] if name else []))
+            GLib.idle_add(self.gateway_set, rc, out, name)
         threading.Thread(target=work, daemon=True).start()
 
-    def started(self, p, auth, secret, keypw):
-        self.busy = None
-        if p.returncode:
-            self.fail("Не удалось подключиться.", (p.stdout + p.stderr).strip())
-        else:
-            if auth == "password":
-                self.pw = secret
-            self.keypw = keypw
-            self.waiting = True
-            self.form.set_reveal_child(False)
-            self.e_pw.set_text("")
-        self.tick()
+    def gateway_set(self, rc, out, name):
+        if rc and friendly(out):
+            self.fail("Не удалось выбрать гейт.", friendly(out))
+        elif self.state in ("on", "internal"):
+            # Переподключение к выбранному гейту (или к лучшему — для автовыбора)
+            self.run(["rediscover-network"], "connecting", login=self.e_login.get_text().strip(), pw=self.pw, gateway=name)
+        self.poke.set()
         return False
 
-    def sso(self, portal, loc, cert, keypw):
-        # SSO/SAML: gpauth показывает окно входа организации от имени пользователя,
-        # а результат входа уходит в gpclient вместо пароля
-        self.errbox.hide()
-        self.busy = "sso"
-        self.refresh()
-        cmd = [GPAUTH, portal]
+    def forget_user(self):
+        self.pw = None
+        self.run(["remove-user"], "disconnecting" if self.state in ("on", "internal") else None, yes=True)
 
+    def resubmit_hip(self):
         def work():
-            try:
-                self.gpauth = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                out, err = self.gpauth.communicate()
-                rc = self.gpauth.returncode
-            except OSError as e:
-                out, err, rc = "", str(e), 1
-            GLib.idle_add(self.sso_done, rc, out, err, portal, loc, cert, keypw)
+            rc, out = gp("resubmit-hip", timeout=120)
+            GLib.idle_add(lambda: notify("HIP-отчёт отправлен") if rc == 0 else self.fail("HIP-отчёт не отправлен.", friendly(out) or out[-300:]))
         threading.Thread(target=work, daemon=True).start()
-
-    def sso_done(self, rc, out, err, portal, loc, cert, keypw):
-        self.gpauth = None
-        if self.busy != "sso":  # вход отменили
-            return False
-        self.busy = None
-        if rc or not out.strip():
-            lines = [l for l in err.splitlines() if l.strip()]
-            self.fail("Вход через SSO не выполнен.", lines[-1].split("] ", 1)[-1][:300] if lines else "")
-        else:
-            self.start(portal, loc, "-", "cookie", out, cert, keypw)
-        return False
-
-    def cancel_sso(self):
-        self.busy = None
-        if self.gpauth:
-            self.gpauth.terminate()
-        self.refresh()
-
-    def disconnect(self):
-        self.waiting = False
-        self.busy = "disconnecting"
-        self.refresh()
-
-        def work():
-            subprocess.run(["sudo", "-n", VPN, "disconnect"], capture_output=True)
-            GLib.idle_add(self.stopped)
-        threading.Thread(target=work, daemon=True).start()
-
-    def stopped(self):
-        self.busy = None
-        self.tick()
-        return False
 
     def show_log(self):
         win = Gtk.Window(title=f"{T} — журнал подключения", default_width=780, default_height=440)
@@ -727,7 +764,7 @@ class Tray:
         tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
                           left_margin=10, right_margin=10, top_margin=8, bottom_margin=8)
         buf = tv.get_buffer()
-        buf.set_text(read(LOG) or "Журнал пуст")
+        buf.set_text("\n\n".join(self.log) or "Журнал пуст")
         buf.place_cursor(buf.get_end_iter())
         sw = Gtk.ScrolledWindow()
         sw.add(tv)
@@ -735,49 +772,18 @@ class Tray:
         win.show_all()
         GLib.idle_add(tv.scroll_mark_onscreen, buf.get_insert())
 
+        def errors():
+            text = "\n\n".join(x for x in (gp("show", "--error")[1], gp("show", "--notification")[1]) if x)
+            GLib.idle_add(lambda: buf.insert(buf.get_end_iter(), "\n\n— Сообщения клиента —\n" + text) and False)
+        threading.Thread(target=errors, daemon=True).start()
+
     def fail(self, text, details=""):
         self.error.set_text(text + ("\n" + details if details else ""))
         if not self.win.get_visible():
             notify(text)
-            self.toggle()
+            self.show_panel()
         self.errbox.show()
         self.refresh()
-
-    # ---------- раз в секунду ----------
-    def tick(self):
-        old, self.state = self.state, vpn_state()
-        s = settings()
-        if self.state == "on" and old != "on":
-            self.since, self.ip = connected_since(), tun_ip()
-        st = self.shown_state()
-        if self.icon:
-            self.icon.set_from_icon_name(ICONS[st])
-            self.icon.set_tooltip_text(f"{T}: {TITLES[st]}" + (f" — {self.where_text(s)}" if st == "on" else ""))
-        if self.busy:
-            pass  # промежуточные состояния во время sudo gp-vpn не считаем
-        elif self.waiting and self.state == "on":
-            self.waiting = False
-            notify("VPN подключен: " + self.where_text(s))
-        elif self.waiting and self.state == "off":
-            self.waiting = False
-            self.pw = None  # возможно, пароль неверный — в следующий раз спросим
-            self.fail("Не удалось подключиться.", last_error())
-        elif old == "on" and self.state == "off":
-            notify("VPN отключен")
-        elif old == "off" and self.state == "on":
-            notify("VPN подключен: " + self.where_text(s))
-        # Служба узнала (или обновила) список гейтов портала — обновляем выбор
-        try:
-            mtime = os.stat(f"{STATE}/gateways").st_mtime_ns
-        except OSError:
-            mtime = None
-        if mtime != self.gw_mtime:
-            self.gw_mtime = mtime
-            if not self.combo.get_property("popup-shown"):
-                self.fill_gateways()
-        if self.win.get_visible():
-            self.refresh()
-        return True
 
 
 # Один экземпляр на пользователя; повторный запуск (ярлык в меню) открывает панель уже запущенного
@@ -799,6 +805,7 @@ if not GREETER:
     Notify.init(T)
 tray = Tray()
 GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda: tray.show_panel() or True)
+GLib.timeout_add_seconds(1, lambda: tray.refresh() or True)  # время подключения
 if GREETER or "--show" in sys.argv:
     GLib.idle_add(lambda: tray.show_panel() or False)
 Gtk.main()

@@ -1,7 +1,6 @@
 #!/bin/sh
 set -e
-# gpclient удаляется вместе с пакетом — рвём соединение
 if [ "$1" = remove ]; then
-  systemctl stop gp-vpn 2>/dev/null || true
+  systemctl disable --now gp-vpn-agent.service 2>/dev/null || true
 fi
 exit 0

@@ -1,1 +1,1 @@
-ALL ALL=(root) NOPASSWD: /usr/sbin/gp-vpn
+ALL ALL=(gpvpn) NOPASSWD: /usr/libexec/gp-vpn/gp

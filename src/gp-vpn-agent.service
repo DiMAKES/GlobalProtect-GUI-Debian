@@ -1,0 +1,17 @@
+[Unit]
+Description=GlobalProtect agent of the gpvpn account (VPN on the login screen and across logins)
+After=gpd.service
+Wants=gpd.service
+
+[Service]
+# PanGPA работает, только пока у пользователя есть активный сеанс (loginctl State=active):
+# PAMName открывает такой сеанс (без экрана) для служебной учётки
+User=gpvpn
+PAMName=login
+WorkingDirectory=/opt/paloaltonetworks/globalprotect
+ExecStart=/opt/paloaltonetworks/globalprotect/PanGPA start
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

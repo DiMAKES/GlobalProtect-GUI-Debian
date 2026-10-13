@@ -1,6 +1,8 @@
 #!/bin/sh
 set -e
 if [ "$1" = purge ]; then
-  rm -rf /var/lib/gp-vpn
+  rm -f /var/lib/AccountsService/users/gpvpn
+  userdel -r gpvpn 2>/dev/null || true
 fi
+[ "$1" = remove ] && systemctl daemon-reload 2>/dev/null || true
 exit 0

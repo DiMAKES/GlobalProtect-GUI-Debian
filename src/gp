@@ -1,0 +1,26 @@
+#!/bin/bash
+# globalprotect (официальный CLI Palo Alto) от имени служебной учётки, у которой работает агент:
+#   sudo -n -u gpvpn /usr/libexec/gp-vpn/gp <команда> [параметры]
+# Её разрешено запускать всем (и экрану входа), поэтому пропускаем только команды, нужные панели.
+# CLI допускает один свой экземпляр на пользователя — вызовы панелей идут по очереди (flock).
+[ "$(id -un)" = gpvpn ] || { echo "Запускайте от gpvpn: sudo -n -u gpvpn $0 …" >&2; exit 2; }
+export HOME=/var/lib/gpvpn XDG_RUNTIME_DIR="/run/user/$(id -u)"
+cd "$HOME" || exit 1
+case "${1:-}" in
+  connect|disconnect|show|set-preferred-gateway|rediscover-network|resubmit-hip|remove-user|defaultbrowser) ;;
+  *) echo "Команда не разрешена: ${1:-<пусто>}" >&2; exit 2 ;;
+esac
+
+# Последний портал — для панелей всех пользователей и экрана входа (каталог 711, файл 644)
+if [ "$1" = connect ]; then
+  for ((i = 2; i <= $#; i++)); do
+    if [ "${!i}" = --portal ] || [ "${!i}" = -p ]; then
+      j=$((i + 1))
+      printf '%s\n' "${!j}" > "$HOME/portal" && chmod 644 "$HOME/portal"
+    fi
+  done
+fi
+
+exec 9>"$XDG_RUNTIME_DIR/gp-cli.lock"
+flock -w 15 9 || { echo "GlobalProtect занят другой командой" >&2; exit 75; }
+exec /usr/bin/globalprotect "$@"

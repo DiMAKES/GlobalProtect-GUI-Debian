@@ -1,0 +1,28 @@
+#!/bin/bash
+# Настройка под официальный GlobalProtect (вызывается при установке пакета, от root; можно повторять).
+# Агент PanGPA работает одной системной службой gp-vpn-agent от служебной учётки gpvpn, поэтому VPN
+# доступен на экране входа и не рвётся при входе/выходе пользователей. Панели всех пользователей
+# и экрана входа управляют им через: sudo -n -u gpvpn /usr/libexec/gp-vpn/gp <команда>
+set -e
+U=gpvpn
+H=/var/lib/gpvpn
+
+if ! id -u "$U" >/dev/null 2>&1; then
+  # Обычная, не системная учётка: CLI GlobalProtect отказывается работать от системных пользователей
+  useradd --create-home --home-dir "$H" --shell /usr/sbin/nologin --comment "GlobalProtect VPN" "$U"
+fi
+passwd -l "$U" >/dev/null 2>&1 || true
+chmod 711 "$H"  # внутрь не заглянуть, но файл с последним порталом (644) читается панелями
+
+# Не показывать учётку на экране входа
+mkdir -p /var/lib/AccountsService/users
+printf '[User]\nSystemAccount=true\n' > "/var/lib/AccountsService/users/$U"
+
+# Личный агент пользователей (gpa.service) отключает drop-in /etc/systemd/user/gpa.service.d/gp-vpn.conf из пакета
+loginctl disable-linger "$U" 2>/dev/null || true
+systemctl daemon-reload
+for p in $(pgrep -x PanGPA || true); do
+  [ "$(stat -c %U "/proc/$p")" = "$U" ] || kill "$p" 2>/dev/null || true
+done
+systemctl enable gp-vpn-agent.service >/dev/null 2>&1
+systemctl restart gp-vpn-agent.service
