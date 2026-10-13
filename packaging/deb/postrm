@@ -2,6 +2,7 @@
 set -e
 if [ "$1" = purge ]; then
   rm -f /var/lib/AccountsService/users/gpvpn
+  command -v dconf >/dev/null && dconf update || true
   userdel -r gpvpn 2>/dev/null || true
 fi
 [ "$1" = remove ] && systemctl daemon-reload 2>/dev/null || true

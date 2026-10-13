@@ -1,0 +1,3 @@
+# gp-vpn: кнопка VPN GlobalProtect в системном меню экрана входа (расширение GNOME Shell)
+[org/gnome/shell]
+enabled-extensions=['gp-vpn@dimakes.github.io']

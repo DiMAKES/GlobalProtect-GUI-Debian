@@ -1,0 +1,6 @@
+.gp-vpn-content { spacing: 6px; min-width: 340px; }
+.gp-vpn-title { font-weight: bold; font-size: 14pt; padding-bottom: 6px; }
+.gp-vpn-caption { color: #9aa0bd; font-size: 9pt; font-weight: bold; padding-top: 6px; }
+.gp-vpn-text { padding-bottom: 4px; }
+.gp-vpn-error { color: #ff7a8f; padding-top: 6px; }
+.gp-vpn-option { padding: 8px 12px; border-radius: 9px; text-align: left; }

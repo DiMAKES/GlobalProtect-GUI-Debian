@@ -8,7 +8,7 @@ URL:            @URL@
 BuildArch:      noarch
 # Официальный клиент Palo Alto ставится отдельно (его выдаёт организация)
 Requires:       /opt/paloaltonetworks/globalprotect/PanGPA
-Requires:       python3, python3-gobject, sudo, systemd, util-linux
+Requires:       python3, python3-gobject, sudo, systemd, util-linux, dconf
 # Fedora/RHEL — первое имя, openSUSE — второе
 Requires:       (python3-cairo or python3-gobject-cairo)
 Requires:       (gtk3 or typelib-1_0-Gtk-3_0)
@@ -21,7 +21,8 @@ Conflicts:      globalprotect-openconnect
 %description
 Tray icon and Windows-like panel for the official Palo Alto Networks
 GlobalProtect client (CLI version): status, connect/disconnect, OTP and other
-prompts, gateway switching on the fly, connecting from the login screen.
+prompts, gateway switching on the fly; a GNOME Shell extension adds a VPN
+toggle to the login and lock screens.
 The agent runs under the gpvpn service account, so the VPN works before
 login and survives logins and logouts.
 
@@ -35,7 +36,7 @@ cp -a @ROOT@/. %{buildroot}/
 if [ "$1" -eq 0 ]; then systemctl disable --now gp-vpn-agent.service 2>/dev/null || :; fi
 
 %postun
-if [ "$1" -eq 0 ]; then systemctl daemon-reload 2>/dev/null || :; fi
+if [ "$1" -eq 0 ]; then systemctl daemon-reload 2>/dev/null || :; dconf update 2>/dev/null || :; fi
 
 %files
 @FILES@

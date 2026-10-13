@@ -26,3 +26,6 @@ for p in $(pgrep -x PanGPA || true); do
 done
 systemctl enable gp-vpn-agent.service >/dev/null 2>&1
 systemctl restart gp-vpn-agent.service
+
+# Кнопка VPN на экране входа: расширение включено для gdm файлом /etc/dconf/db/gdm.d/90-gp-vpn
+command -v dconf >/dev/null && dconf update || true

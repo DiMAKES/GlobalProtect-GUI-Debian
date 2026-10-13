@@ -10,7 +10,7 @@ set -eo pipefail
 umask 022
 cd "$(dirname "$(readlink -f "$0")")"
 
-VERSION=3.0
+VERSION=3.1
 URL=https://github.com/DiMAKES/GlobalProtect-GUI-Debian
 MAINTAINER=${MAINTAINER:-"$(git config user.name 2>/dev/null || echo gp-vpn) <$(git config user.email 2>/dev/null || echo root@localhost)>"}
 FORMATS=${*:-deb rpm tar}
@@ -22,13 +22,18 @@ mkdir -p dist
 stage() {  # $1 — дерево пакета
   local R=$1
   install -D -m 755 src/gp-vpn-tray  "$R/usr/bin/gp-vpn-tray"
+  install -D -m 644 src/gpvpn.py     "$R/usr/lib/gp-vpn/gpvpn.py"
   install -D -m 755 src/gp           "$R/usr/libexec/gp-vpn/gp"
   install -D -m 755 src/gp-vpn-setup "$R/usr/libexec/gp-vpn/setup"
   install -D -m 644 src/gp-vpn-agent.service "$R/usr/lib/systemd/system/gp-vpn-agent.service"
   install -D -m 644 src/gpa-gp-vpn.conf      "$R/etc/systemd/user/gpa.service.d/gp-vpn.conf"
   install -D -m 440 src/gp-vpn.sudoers       "$R/etc/sudoers.d/gp-vpn"
   install -D -m 644 src/gp-vpn.desktop         "$R/usr/share/applications/gp-vpn.desktop"
-  install -D -m 644 src/gp-vpn-greeter.desktop "$R/usr/share/gdm/greeter/autostart/gp-vpn.desktop"  # экран входа
+  local X=usr/share/gnome-shell/extensions/gp-vpn@dimakes.github.io  # экран входа и блокировки
+  for f in metadata.json extension.js stylesheet.css; do
+    install -D -m 644 "src/shell-extension/gp-vpn@dimakes.github.io/$f" "$R/$X/$f"
+  done
+  install -D -m 644 src/gp-vpn-gdm.dconf "$R/etc/dconf/db/gdm.d/90-gp-vpn"
   install -D -m 644 src/gp-vpn-tray.desktop    "$R/etc/xdg/autostart/gp-vpn-tray.desktop"            # сеанс
   install -D -m 644 LICENSE   "$R/usr/share/doc/gp-vpn/LICENSE"
   install -D -m 644 README.md "$R/usr/share/doc/gp-vpn/README.md"
@@ -61,16 +66,17 @@ Maintainer: $MAINTAINER
 Section: net
 Priority: optional
 Installed-Size: $(size_kb "$R")
-Depends: globalprotect, python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, gir1.2-notify-0.7, sudo, systemd, passwd, procps, util-linux
+Depends: globalprotect, python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, gir1.2-notify-0.7, sudo, systemd, passwd, procps, util-linux, dconf-cli
 Recommends: gnome-shell-extension-appindicator
 Conflicts: globalprotect-openconnect
 Homepage: $URL
 Description: $DESC
  Tray icon and Windows-like panel for the official Palo Alto Networks
  GlobalProtect client (CLI version): status, connect/disconnect, OTP and
- other client prompts, gateway switching on the fly, connecting from the
- login screen. The agent runs under the gpvpn service account, so the VPN
- works before login and survives logins and logouts.
+ other client prompts, gateway switching on the fly. A GNOME Shell
+ extension adds a VPN toggle to the login and lock screens. The agent runs
+ under the gpvpn service account, so the VPN works before login and
+ survives logins and logouts.
 EOF
   dpkg-deb --root-owner-group -Zxz --build "$R" "dist/gp-vpn_${VERSION}_all.deb" >/dev/null
 }
@@ -84,7 +90,8 @@ build_rpm() {
     /^\/etc\//                     { print "%config(noreplace) " $0; next }
     /^\/usr\/share\/doc\/gp-vpn\// { next }
                                    { print }
-    END { print "%dir /usr/libexec/gp-vpn"; print "%dir /etc/systemd/user/gpa.service.d"; print "%doc /usr/share/doc/gp-vpn" }' > "$B/files"
+    END { print "%dir /usr/libexec/gp-vpn"; print "%dir /usr/lib/gp-vpn"; print "%dir /etc/systemd/user/gpa.service.d"
+          print "%dir /usr/share/gnome-shell/extensions/gp-vpn@dimakes.github.io"; print "%doc /usr/share/doc/gp-vpn" }' > "$B/files"
   python3 - "$B/gp-vpn.spec" "$R" "$B/files" "$VERSION" "$URL" <<'EOF'
 import sys
 out, root, files, version, url = sys.argv[1:]
