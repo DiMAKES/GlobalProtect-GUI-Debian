@@ -1,0 +1,6 @@
+[Unit]
+Description=GlobalProtect VPN: DNS туннеля в систему (gp-vpn)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/gp-vpn/dns

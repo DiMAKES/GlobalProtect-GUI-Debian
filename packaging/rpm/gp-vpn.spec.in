@@ -33,7 +33,10 @@ cp -a @ROOT@/. %{buildroot}/
 /usr/libexec/gp-vpn/setup || :
 
 %preun
-if [ "$1" -eq 0 ]; then systemctl disable --now gp-vpn-agent.service 2>/dev/null || :; fi
+if [ "$1" -eq 0 ]; then
+  systemctl disable --now gp-vpn-agent.service 2>/dev/null || :
+  systemctl disable --now gp-vpn-dns.path 2>/dev/null; rm -f /run/NetworkManager/conf.d/90-gp-vpn-dns.conf; nmcli general reload conf,dns-rc 2>/dev/null || :
+fi
 
 %postun
 if [ "$1" -eq 0 ]; then systemctl daemon-reload 2>/dev/null || :; dconf update 2>/dev/null || :; fi

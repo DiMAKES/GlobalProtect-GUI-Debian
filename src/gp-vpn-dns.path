@@ -1,0 +1,10 @@
+[Unit]
+Description=GlobalProtect VPN: DNS туннеля в систему (gp-vpn)
+
+[Path]
+# Клиент переписывает их при каждом подключении и отключении
+PathChanged=/etc/NetworkManager/system-connections/gpd0.nmconnection
+PathChanged=/opt/paloaltonetworks/globalprotect/network/config/resolv.conf
+
+[Install]
+WantedBy=multi-user.target

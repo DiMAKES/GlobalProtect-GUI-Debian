@@ -10,7 +10,7 @@ set -eo pipefail
 umask 022
 cd "$(dirname "$(readlink -f "$0")")"
 
-VERSION=3.1
+VERSION=3.1.3
 URL=https://github.com/DiMAKES/GlobalProtect-GUI-Debian
 MAINTAINER=${MAINTAINER:-"$(git config user.name 2>/dev/null || echo gp-vpn) <$(git config user.email 2>/dev/null || echo root@localhost)>"}
 FORMATS=${*:-deb rpm tar}
@@ -26,6 +26,9 @@ stage() {  # $1 — дерево пакета
   install -D -m 755 src/gp           "$R/usr/libexec/gp-vpn/gp"
   install -D -m 755 src/gp-vpn-setup "$R/usr/libexec/gp-vpn/setup"
   install -D -m 644 src/gp-vpn-agent.service "$R/usr/lib/systemd/system/gp-vpn-agent.service"
+  install -D -m 755 src/gp-vpn-dns   "$R/usr/libexec/gp-vpn/dns"
+  install -D -m 644 src/gp-vpn-dns.path    "$R/usr/lib/systemd/system/gp-vpn-dns.path"
+  install -D -m 644 src/gp-vpn-dns.service "$R/usr/lib/systemd/system/gp-vpn-dns.service"
   install -D -m 644 src/gpa-gp-vpn.conf      "$R/etc/systemd/user/gpa.service.d/gp-vpn.conf"
   install -D -m 440 src/gp-vpn.sudoers       "$R/etc/sudoers.d/gp-vpn"
   install -D -m 644 src/gp-vpn.desktop         "$R/usr/share/applications/gp-vpn.desktop"

@@ -25,7 +25,12 @@ for p in $(pgrep -x PanGPA || true); do
   [ "$(stat -c %U "/proc/$p")" = "$U" ] || kill "$p" 2>/dev/null || true
 done
 systemctl enable gp-vpn-agent.service >/dev/null 2>&1
-systemctl restart gp-vpn-agent.service
+systemctl start gp-vpn-agent.service  # не restart: перезапуск агента рвёт текущее подключение
+
+# DNS туннеля в систему при NetworkManager (сам клиент его туда не доносит): /usr/libexec/gp-vpn/dns
+systemctl enable gp-vpn-dns.path >/dev/null 2>&1
+systemctl restart gp-vpn-dns.path
+/usr/libexec/gp-vpn/dns || true
 
 # Кнопка VPN на экране входа: расширение включено для gdm файлом /etc/dconf/db/gdm.d/90-gp-vpn
 command -v dconf >/dev/null && dconf update || true
