@@ -231,12 +231,13 @@ class GPIndicator extends SystemIndicator {
 
 export default class GPVpnExtension extends Extension {
     enable() {
+        console.log(`gp-vpn: enable (${Main.sessionMode.currentMode})`);
         this._st = {state: null, details: {}, gateways: [], portal: ''};
         this._busy = null;
         this._login = '';
         this._pw = null;
         this._indicator = new GPIndicator(this);
-        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+        this._addToMenu();
         this._poll();
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
             this._poll();
@@ -244,7 +245,29 @@ export default class GPVpnExtension extends Extension {
         });
     }
 
+    _addToMenu() {
+        // Системное меню собирается асинхронно — ждём его, если ещё не готово
+        const qs = Main.panel.statusArea.quickSettings;
+        if (!qs?._indicators) {
+            this._wait = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                this._wait = 0;
+                this._addToMenu();
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
+        }
+        try {
+            qs.addExternalIndicator(this._indicator);
+            console.log('gp-vpn: кнопка добавлена в системное меню');
+        } catch (e) {
+            console.error(`gp-vpn: не удалось добавить кнопку: ${e}`);
+        }
+    }
+
     disable() {
+        console.log(`gp-vpn: disable (${Main.sessionMode.currentMode})`);
+        if (this._wait)
+            GLib.source_remove(this._wait);
         GLib.source_remove(this._timer);
         this._session?.cancel();
         this._dialog?.close();
