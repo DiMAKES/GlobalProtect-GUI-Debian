@@ -1,0 +1,8 @@
+{
+  "uuid": "gp-vpn@dimakes.github.io",
+  "name": "GlobalProtect VPN",
+  "description": "Кнопка VPN GlobalProtect (gp-vpn) в системном меню на экране входа и экране блокировки: подключить, отключить, сменить гейт, ответить на запросы клиента.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "session-modes": ["gdm", "unlock-dialog"],
+  "url": "https://github.com/DiMAKES/GlobalProtect-GUI-Debian"
+}

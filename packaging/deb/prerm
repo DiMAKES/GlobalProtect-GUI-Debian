@@ -2,5 +2,6 @@
 set -e
 if [ "$1" = remove ]; then
   systemctl disable --now gp-vpn-agent.service 2>/dev/null || true
+  systemctl disable --now gp-vpn-dns.path 2>/dev/null; rm -f /run/NetworkManager/conf.d/90-gp-vpn-dns.conf; nmcli general reload conf,dns-rc 2>/dev/null || true
 fi
 exit 0

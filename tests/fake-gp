@@ -1,0 +1,51 @@
+#!/usr/bin/python3
+# Имитация официального CLI globalprotect для проверок панели и расширения без настоящего портала:
+#   GP_VPN_GP=tests/fake-gp gp-vpn-tray        (тексты запросов — как у настоящего CLI)
+# Пароль — secret, код — 123456. Состояние — в $FAKE_GP_STATE (по умолчанию /tmp/fake-gp.json).
+import getpass, json, os, sys, time
+ST = os.environ.get("FAKE_GP_STATE", "/tmp/fake-gp.json")
+GW = [("Moscow", "gw-msk.example.com"), ("Saint Petersburg", "gw-spb.example.com"), ("Ekaterinburg", "gw-ekb.example.com")]
+st = json.load(open(ST)) if os.path.exists(ST) else {"status": "Disconnected", "pref": "", "gw": ""}
+save = lambda: json.dump(st, open(ST, "w"))
+spin = "\r" + " " * 71 + "\r"
+a = sys.argv[1:]
+w = lambda s: (sys.stdout.write(s), sys.stdout.flush())
+if a[:2] == ["show", "--status"]:
+    w(f"{spin}GlobalProtect status: {st['status']}\n")
+elif a[:2] == ["show", "--details"]:
+    on = st["status"].startswith("Connected")
+    name = st["gw"] if on else ""
+    w(f"{spin}Gateway Name: {dict(GW).get(name, '')}\nGateway Description: {name}\nAssigned IP Address: {'10.0.12.34' if on else ''}\n"
+      f"Gateway IP Address: {'198.51.100.7' if on else ''}\nGateway Location: \nProtocol: {'IPSec' if on else ''}\n"
+      f"Uptime(sec): {int(time.time() - st.get('since', time.time())) if on else ''}\n")
+elif a[:2] == ["show", "--manual-gateway"]:
+    w(f"{spin}Name                Address            Preferred\n-------------------------------------------------\n")
+    for n, ad in GW:
+        w(f"{n:<20}{ad:<19}{'yes' if st['pref'] == n else 'no'}\n")
+elif a[:1] == ["set-preferred-gateway"]:
+    st["pref"] = a[2] if len(a) > 2 else ""
+    save(); w(f"{spin}Preferred gateway has been {'set' if st['pref'] else 'removed'} successfully.\n")
+elif a[:1] == ["connect"]:
+    portal = a[a.index("--portal") + 1]
+    user = a[a.index("--username") + 1] if "--username" in a else ""
+    w(f"{spin}Retrieving configuration...\n{spin}{portal} - Enter login credentials\nUsername({user}):")
+    input()
+    if getpass.getpass("Password:") != "secret" or getpass.getpass("Please input passcode:") != "123456":
+        w("User authentication failed\n"); sys.exit(1)
+    if not st["pref"]:
+        w("Select a gateway that you want to manually connect.\n")
+        for i, (n, ad) in enumerate(GW, 1):
+            w(f"{i}. {n}  {ad}\n")
+        w(f"Please choose gateway from the list above(1-{len(GW)}):")
+        st["gw"] = GW[int(input()) - 1][0]
+    else:
+        st["gw"] = st["pref"]
+    st["status"], st["since"] = "Connected", time.time(); save(); w("Connected\n")
+elif a[:1] == ["rediscover-network"]:
+    st["gw"] = st["pref"] or GW[0][0]; st["since"] = time.time(); save(); w(f"{spin}Network rediscovery is done.\n")
+elif a[:1] == ["disconnect"]:
+    st["status"] = "Disconnected"; save(); w(f"{spin}Disconnect is successful.\n")
+elif a[:1] == ["remove-user"]:
+    w("Do you want to continue(y/n)?"); w("\nSaved user credentials removed successfully.\n" if input().lower() == "y" else "\n")
+else:
+    w("Wrong usage, please try again...\n"); sys.exit(1)

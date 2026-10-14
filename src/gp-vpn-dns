@@ -1,0 +1,19 @@
+#!/bin/sh
+# DNS туннеля — в систему (от root, запускает gp-vpn-dns.path при каждом подключении и отключении).
+# Официальный клиент при NetworkManager пишет DNS туннеля только в профиль gpd0
+# (nmcli connection modify gpd0 ipv4.dns …), но интерфейсом gpd0 NetworkManager не управляет,
+# и DNS не применяется: внутренние имена (сервер 1С и т. п.) не находятся. Пока туннель поднят,
+# отдаём эти DNS NetworkManager глобальной настройкой в /run, при отключении убираем.
+CONF=/run/NetworkManager/conf.d/90-gp-vpn-dns.conf
+sleep 1  # клиент меняет серверы и домены двумя командами подряд
+nmcli -t general status >/dev/null 2>&1 || exit 0
+dns=$(nmcli -g ipv4.dns connection show gpd0 2>/dev/null)
+search=$(nmcli -g ipv4.dns-search connection show gpd0 2>/dev/null | tr , '\n' | grep -v '^~' | paste -sd, -)
+if [ -n "$dns" ] && ip -4 -o addr show dev gpd0 up 2>/dev/null | grep -q inet; then
+  mkdir -p "${CONF%/*}"
+  printf '# gp-vpn: DNS туннеля GlobalProtect, пока он поднят\n[global-dns]\nsearches=%s\n\n[global-dns-domain-*]\nservers=%s\n' "$search" "$dns" >"$CONF"
+else
+  [ -e "$CONF" ] || exit 0
+  rm -f "$CONF"
+fi
+nmcli general reload conf,dns-rc
